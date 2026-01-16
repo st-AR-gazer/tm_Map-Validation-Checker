@@ -1,0 +1,8 @@
+[meta]
+name = ""
+author = "ar....."
+version = "0.1.0"
+category = "!"
+
+[script]
+optional_dependencies = [ "" ]
