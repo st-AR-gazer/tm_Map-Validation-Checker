@@ -53,13 +53,13 @@ See: [Replay matching](#replay-matching)
 
 If GPS scan is enabled (default):
 
-* If a GPS ghost block exists with race time equal to map `AuthorTime`:
+* If GPS record data contains a time within a tolerance of map `AuthorTime`:
 
   * `type: "gps"`
   * `validated: "Maybe"` by default
   * `validated: "Yes"` if `--strict-gps` is enabled
 
-You can disable GPS scanning with `--no-gps`.
+By default, GPS matching allows ±100 ms because GPS times are stored to the nearest tenth of a second. You can disable GPS scanning with `--no-gps` or change the tolerance with `--gps-threshold-ms`.
 
 ### 5) Script metadata validation (normal vs plugin suspicion)
 
@@ -161,6 +161,9 @@ GPS options:
 
 * `--no-gps`
   Disable GPS scanning entirely.
+
+* `--gps-threshold-ms <ms>`
+  GPS author time tolerance in milliseconds (default: 100). This exists because GPS times are stored to the nearest tenth of a second.
 
 Traversal safety:
 
@@ -264,6 +267,12 @@ MapValidationChecker --single "C:\Maps\MyMap.Map.Gbx" --strict-gps
 
 ```bash
 MapValidationChecker --batch "C:\Maps" --max-depth 8 --pretty
+```
+
+### 9) Customize GPS tolerance
+
+```bash
+MapValidationChecker --single "C:\Maps\MyMap.Map.Gbx" --gps-threshold-ms 150
 ```
 
 ---

@@ -16,6 +16,7 @@ using GBX.NET.LZO;
 internal sealed class Program
 {
     private const string WaypointTimesKey = "Race_AuthorRaceWaypointTimes";
+    private const int DefaultGpsThresholdMs = 100;
 
     private static int Main(string[] args)
     {
@@ -191,13 +192,26 @@ internal sealed class Program
         // 4) GPS check (optional)
         if (opts.GpsEnabled && authorMs.HasValue)
         {
-            if (HasGpsGhostAtAuthorTime(map, authorMs.Value, opts.MaxDepth))
+            if (HasGpsGhostAtAuthorTime(map, authorMs.Value, opts.MaxDepth, opts.GpsThresholdMs, out var gpsMatch))
             {
                 report.Type = "gps";
                 report.Validated = opts.StrictGps ? "Yes" : "Maybe";
+
+                var matchNote = gpsMatch is null
+                    ? null
+                    : $"gpsTimeMs={gpsMatch.GpsTimeMs}, deltaMs={gpsMatch.DeltaMs}, source={gpsMatch.Source}.";
+
                 report.Note = opts.StrictGps
-                    ? "GPS ghost with matching race time found (strict mode => validated Yes)."
-                    : "GPS ghost with matching race time found (still potentially invalid).";
+                    ? JoinNonEmpty(
+                        $"GPS author time match found within \u00b1{opts.GpsThresholdMs} ms.",
+                        "GPS times are stored to the nearest tenth of a second, so small discrepancies are expected.",
+                        "Strict mode => validated Yes.",
+                        matchNote)
+                    : JoinNonEmpty(
+                        $"GPS author time match found within \u00b1{opts.GpsThresholdMs} ms.",
+                        "GPS times are stored to the nearest tenth of a second, so small discrepancies are expected.",
+                        "Still potentially invalid.",
+                        matchNote);
                 return report;
             }
         }
@@ -390,10 +404,27 @@ internal sealed class Program
     // GPS scan
     // ----------------------------
 
-    private static bool HasGpsGhostAtAuthorTime(CGameCtnChallenge map, int authorMs, int? maxDepth)
+    private static bool HasGpsGhostAtAuthorTime(
+        CGameCtnChallenge map,
+        int authorMs,
+        int? maxDepth,
+        int gpsThresholdMs,
+        out GpsMatchInfo? matchInfo)
     {
+        matchInfo = null;
+
         if (map.ClipGroupInGame is null)
             return false;
+
+        foreach (var candidate in EnumerateGpsRecordDataCandidates(map))
+        {
+            var delta = Math.Abs(candidate.TimeMs - authorMs);
+            if (delta <= gpsThresholdMs)
+            {
+                matchInfo = new GpsMatchInfo(candidate.TimeMs, delta, candidate.Source);
+                return true;
+            }
+        }
 
         foreach (var block in TraverseForType<CGameCtnMediaBlockGhost>(map.ClipGroupInGame, maxDepth))
         {
@@ -402,15 +433,84 @@ internal sealed class Program
                 continue;
 
             var t = TimeToMs(ghost.RaceTime);
-            if (t.HasValue && t.Value == authorMs)
+            if (!t.HasValue)
+                continue;
+
+            var delta = Math.Abs(t.Value - authorMs);
+            if (delta <= gpsThresholdMs)
+            {
+                matchInfo = new GpsMatchInfo(t.Value, delta, "CGameCtnMediaBlockGhost.GhostModel.RaceTime");
                 return true;
+            }
         }
 
         return false;
     }
 
-    private static IEnumerable<T> TraverseForType<T>(object root, int? maxDepth)
-        where T : class
+    private static IEnumerable<GpsCandidate> EnumerateGpsRecordDataCandidates(CGameCtnChallenge map)
+    {
+        var clipGroup = map.ClipGroupInGame;
+        if (clipGroup?.Clips is null || clipGroup.Clips.Count == 0)
+            yield break;
+
+        for (int triggerIndex = 0; triggerIndex < clipGroup.Clips.Count; triggerIndex++)
+        {
+            var trigger = clipGroup.Clips[triggerIndex];
+            var clip = trigger.Clip;
+            if (clip?.Tracks is null || clip.Tracks.Count == 0)
+                continue;
+
+            for (int trackIndex = 0; trackIndex < clip.Tracks.Count; trackIndex++)
+            {
+                var track = clip.Tracks[trackIndex];
+                if (track?.Blocks is null || track.Blocks.Count == 0)
+                    continue;
+
+                for (int blockIndex = 0; blockIndex < track.Blocks.Count; blockIndex++)
+                {
+                    var block = track.Blocks[blockIndex];
+                    if (block is not CGameCtnMediaBlockEntity entityBlock)
+                        continue;
+
+                    var recordData = entityBlock.RecordData;
+                    if (recordData?.EntList is null || recordData.EntList.Count == 0)
+                        continue;
+
+                    for (int entIndex = 0; entIndex < recordData.EntList.Count; entIndex++)
+                    {
+                        var ent = recordData.EntList[entIndex];
+                        var basePath =
+                            $"ClipGroupInGame.Clips[{triggerIndex}].Clip.Tracks[{trackIndex}].Blocks[{blockIndex}].RecordData.EntList[{entIndex}]";
+
+                        var u03 = ent.U03;
+                        if (u03 > 0)
+                            yield return new GpsCandidate(u03, $"{basePath}.U03");
+
+                        var samples2 = ent.Samples2;
+                        if (samples2 is null || samples2.Count == 0)
+                            continue;
+
+                        var lastIndex = samples2.Count - 1;
+                        var lastTime = TimeToMs(samples2[lastIndex].Time);
+                        if (lastTime.HasValue)
+                        {
+                            yield return new GpsCandidate(
+                                lastTime.Value,
+                                $"{basePath}.Samples2[{lastIndex}].Time");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static string JoinNonEmpty(params string?[] parts) => string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+
+    private sealed record GpsCandidate(int TimeMs, string Source);
+
+    private sealed record GpsMatchInfo(int GpsTimeMs, int DeltaMs, string Source);
+
+    private static IEnumerable<T> TraverseForType<T>(object root, int? maxDepth) where T : class
     {
         var visited = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var stack = new Stack<(object Obj, int Depth)>();
@@ -699,6 +799,7 @@ internal sealed class Program
 
         bool gpsEnabled = true;
         bool strictGps = false;
+        int gpsThresholdMs = DefaultGpsThresholdMs;
 
         int? maxDepth = null;
 
@@ -771,6 +872,12 @@ internal sealed class Program
                     strictGps = false;
                     break;
 
+                case "--gps-threshold-ms":
+                    if (!int.TryParse(Next(), out var gpsThreshold) || gpsThreshold < 0)
+                        throw new ArgException("--gps-threshold-ms must be a non-negative integer");
+                    gpsThresholdMs = gpsThreshold;
+                    break;
+
                 case "--max-depth":
                     if (!int.TryParse(Next(), out var d) || d < 0)
                         throw new ArgException("--max-depth must be a non-negative integer");
@@ -823,6 +930,7 @@ internal sealed class Program
             output,
             gpsEnabled,
             strictGps,
+            gpsThresholdMs,
             maxDepth
         );
     }
@@ -847,10 +955,12 @@ Flags:
 
   --strict-gps               If GPS ghost matches author time => validated ""Yes"" (default: ""Maybe"")
   --no-gps                   Disable GPS scan
+  --gps-threshold-ms <ms>    GPS author time tolerance in milliseconds (default: 100)
   --max-depth <n>            Limit reflection traversal depth for GPS scan (default: unlimited)
 
 Notes:
   - Manual override has highest priority.
+  - GPS times are stored to the nearest tenth of a second, so small discrepancies are expected.
   - If a validation ghost exists and its race time != author time, an error is returned."
         );
     }
@@ -875,6 +985,7 @@ Notes:
         string? OutputPath,
         bool GpsEnabled,
         bool StrictGps,
+        int GpsThresholdMs,
         int? MaxDepth
     );
 
